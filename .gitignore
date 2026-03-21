@@ -1,0 +1,14 @@
+# Model files
+*.pt
+*.task
+
+# Output files
+*.mp4
+*.jpg
+*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
