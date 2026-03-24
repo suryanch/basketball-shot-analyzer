@@ -77,12 +77,13 @@ def draw_angles(frame: np.ndarray, analysis: FrameAnalysis) -> np.ndarray:
             nonlocal frame
             frame = _put_unicode_text(frame, f"{angle:.0f}°", pt, COLOR_ANGLE_TEXT)
 
-    # Elbow angles near elbow keypoints
-    put_angle(config.KP_LEFT_ELBOW, "LE", analysis.elbow_angle_left)
-    put_angle(config.KP_RIGHT_ELBOW, "RE", analysis.elbow_angle_right)
-    # Knee angles near knee keypoints
-    put_angle(config.KP_LEFT_KNEE, "LK", analysis.knee_angle_left)
-    put_angle(config.KP_RIGHT_KNEE, "RK", analysis.knee_angle_right)
+    # Only draw angles for the shooting side to avoid overlapping labels
+    if analysis.shooting_side == "right":
+        put_angle(config.KP_RIGHT_ELBOW, "RE", analysis.elbow_angle_right)
+        put_angle(config.KP_RIGHT_KNEE, "RK", analysis.knee_angle_right)
+    else:
+        put_angle(config.KP_LEFT_ELBOW, "LE", analysis.elbow_angle_left)
+        put_angle(config.KP_LEFT_KNEE, "LK", analysis.knee_angle_left)
 
     # Release arc in top-right corner
     h, w = frame.shape[:2]
@@ -242,8 +243,96 @@ def draw_ball_state(frame: np.ndarray, ball_state) -> np.ndarray:
     return frame
 
 
+REVIEW_THUMB_W = 480  # width each thumbnail is scaled to in the review panel
+
+
+def build_shot_review_panel(loading_frame: np.ndarray, release_frame: np.ndarray,
+                             load_angles: dict, release_angles: dict) -> np.ndarray:
+    """Build a side-by-side shot review panel with labelled thumbnails and angle strips."""
+
+    def scale_to_width(img, target_w):
+        h, w = img.shape[:2]
+        scale = target_w / w
+        return cv2.resize(img, (target_w, int(h * scale)))
+
+    left = scale_to_width(loading_frame, REVIEW_THUMB_W)
+    right = scale_to_width(release_frame, REVIEW_THUMB_W)
+
+    # Match heights
+    th = max(left.shape[0], right.shape[0])
+    def pad_height(img, target_h):
+        h, w = img.shape[:2]
+        if h < target_h:
+            pad = np.zeros((target_h - h, w, 3), dtype=np.uint8)
+            return np.vstack([img, pad])
+        return img
+    left = pad_height(left, th)
+    right = pad_height(right, th)
+
+    divider = np.zeros((th, 4, 3), dtype=np.uint8)
+    panel_w = REVIEW_THUMB_W * 2 + 4
+
+    # --- Header bar ---
+    header_h = 40
+    header = np.full((header_h, panel_w, 3), 40, dtype=np.uint8)
+    header_text = "SHOT REVIEW  |  Click a frame to expand"
+    cv2.putText(header, header_text, (10, 28),
+                cv2.FONT_HERSHEY_DUPLEX, 0.65, (220, 220, 220), 1, cv2.LINE_AA)
+
+    # --- Label bars ---
+    label_h = 32
+    left_label = np.full((label_h, REVIEW_THUMB_W, 3), (20, 130, 180), dtype=np.uint8)  # amber-ish
+    right_label = np.full((label_h, REVIEW_THUMB_W, 3), (30, 140, 30), dtype=np.uint8)  # green-ish
+    cv2.putText(left_label, "SHOOTING POSITION", (8, 22),
+                cv2.FONT_HERSHEY_DUPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(right_label, "RELEASED", (8, 22),
+                cv2.FONT_HERSHEY_DUPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    label_row = np.hstack([left_label, np.zeros((label_h, 4, 3), dtype=np.uint8), right_label])
+
+    # --- Thumbnail row ---
+    thumb_row = np.hstack([left, divider, right])
+
+    # --- Angle strip ---
+    strip_h = 56
+    strip = np.full((strip_h, panel_w, 3), 25, dtype=np.uint8)
+    le = f"{load_angles.get('elbow'):.1f}" + chr(176) if load_angles.get('elbow') is not None else "N/A"
+    lk = f"{load_angles.get('knee'):.1f}" + chr(176) if load_angles.get('knee') is not None else "N/A"
+    re_ = f"{release_angles.get('elbow'):.1f}" + chr(176) if release_angles.get('elbow') is not None else "N/A"
+    rk = f"{release_angles.get('knee'):.1f}" + chr(176) if release_angles.get('knee') is not None else "N/A"
+    cv2.putText(strip, f"Elbow: {le}   Knee: {lk}", (10, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 215, 255), 1, cv2.LINE_AA)
+    cv2.putText(strip, f"Elbow: {re_}   Knee: {rk}", (REVIEW_THUMB_W + 14, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 100), 1, cv2.LINE_AA)
+    cv2.putText(strip, "Press any key in expanded view to close it", (10, 46),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 140), 1, cv2.LINE_AA)
+
+    return np.vstack([header, label_row, thumb_row, strip])
+
+
+def draw_overlay_text(frame: np.ndarray, text: str, color_bgr: tuple) -> np.ndarray:
+    """Draw large centered overlay text with a semi-transparent dark background."""
+    h, w = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_DUPLEX
+    scale = 2.0
+    thickness = 3
+    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+    x = (w - tw) // 2
+    y = h // 2 + th // 2
+
+    # Semi-transparent background rectangle
+    pad = 20
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x - pad, y - th - pad), (x + tw + pad, y + baseline + pad),
+                  (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+    cv2.putText(frame, text, (x, y), font, scale, color_bgr, thickness, cv2.LINE_AA)
+    return frame
+
+
 def compose_frame(frame: np.ndarray, analysis: FrameAnalysis,
-                  trajectory: list, ball_trajectory: list = None) -> np.ndarray:
+                  trajectory: list, ball_trajectory: list = None,
+                  overlay_text: str = None, overlay_color: tuple = (255, 255, 255)) -> np.ndarray:
     out = frame.copy()
 
     # Draw skeleton for primary person
@@ -257,12 +346,13 @@ def compose_frame(frame: np.ndarray, analysis: FrameAnalysis,
     out = draw_ball_state(out, analysis.ball_state)
     out = draw_shot_phase(out, analysis.shot_phase, analysis.frame_index, analysis.timestamp)
 
-    # Always draw hand landmarks
-    for lm in (analysis.hand_landmarks or []):
-        out = draw_hand_landmarks(out, lm)
+    # Hand landmarks hidden — YOLO pose skeleton already covers the arm
 
     # Draw held object nodes
     for obj in (analysis.held_objects or []):
         out = draw_held_object_nodes(out, obj)
+
+    if overlay_text:
+        out = draw_overlay_text(out, overlay_text, overlay_color)
 
     return out

@@ -16,6 +16,12 @@ class ShotEvent:
     release_arc: Optional[float]       # wrist-based arc
     trajectory: list                   # list of (x, y) wrist positions during shot
     ball_release_arc: Optional[float] = None  # ball-based arc (preferred when available)
+    elbow_angle_at_release: Optional[float] = None  # elbow angle at ball-release frame
+    knee_angle_at_release: Optional[float] = None   # knee angle at ball-release frame
+    release_frame_index: Optional[int] = None       # frame index when ball left hand
+    elbow_angle_at_load: Optional[float] = None     # elbow at deepest squat (pre-jump)
+    knee_angle_at_load: Optional[float] = None      # knee at deepest squat (pre-jump)
+    load_frame_index: Optional[int] = None          # frame index of loading position
 
     @property
     def effective_release_arc(self) -> Optional[float]:
@@ -42,18 +48,35 @@ class ShotDetector:
         self._peak_wrist_speed = 0.0
         self._shot_start_frame = 0
         self._shot_start_ts = 0.0
+        self._release_elbow_angle: Optional[float] = None
+        self._release_knee_angle: Optional[float] = None
+        self._release_frame_index: Optional[int] = None
+        self._min_knee_angle: float = float('inf')
+        self._min_knee_elbow: Optional[float] = None
+        self._min_knee_frame_idx: Optional[int] = None
+        self._load_elbow: Optional[float] = None
+        self._load_knee: Optional[float] = None
+        self._load_frame_idx: Optional[int] = None
 
     def update(self, frame_idx: int, timestamp: float,
                wrist_pos: Optional[tuple],
                knee_angle: Optional[float],
                elbow_angle: Optional[float],
                ball_state=None) -> tuple:
-        """Returns (phase_str, release_arc | None)."""
+        """Returns (phase_str, release_arc | None, load_event | None).
+        load_event is a dict {frame_idx, elbow, knee} emitted once at COCKING→RELEASE."""
         release_arc = None
+        load_event = None
 
         if self.cooldown_frames > 0:
             self.cooldown_frames -= 1
-            return self.state, None
+            return self.state, None, None
+
+        # Capture angles at the exact frame the ball leaves the hand
+        if ball_state is not None and ball_state.just_released:
+            self._release_elbow_angle = elbow_angle
+            self._release_knee_angle = knee_angle
+            self._release_frame_index = frame_idx
 
         if wrist_pos is not None:
             self.wrist_history.append(wrist_pos)
@@ -80,6 +103,12 @@ class ShotDetector:
                 self.shot_trajectory.append(wrist_pos)
             self._peak_wrist_speed = max(self._peak_wrist_speed, speed)
 
+            # Track the frame with maximum knee bend (minimum angle)
+            if knee_angle is not None and knee_angle < self._min_knee_angle:
+                self._min_knee_angle = knee_angle
+                self._min_knee_elbow = elbow_angle
+                self._min_knee_frame_idx = frame_idx
+
             if vy is not None and vy < config.WRIST_UPWARD_THRESHOLD:
                 self._upward_count += 1
             else:
@@ -88,6 +117,20 @@ class ShotDetector:
             if self._upward_count >= config.RELEASE_CONSECUTIVE_FRAMES:
                 self.state = self.RELEASE
                 release_arc = self._compute_release_arc()
+                # Emit load_event and preserve values for ShotEvent
+                if self._min_knee_frame_idx is not None:
+                    load_event = {
+                        "frame_idx": self._min_knee_frame_idx,
+                        "elbow": self._min_knee_elbow,
+                        "knee": self._min_knee_angle,
+                    }
+                    self._load_elbow = self._min_knee_elbow
+                    self._load_knee = self._min_knee_angle
+                    self._load_frame_idx = self._min_knee_frame_idx
+                # Reset min tracking for next shot
+                self._min_knee_angle = float('inf')
+                self._min_knee_elbow = None
+                self._min_knee_frame_idx = None
 
         elif self.state == self.RELEASE:
             if wrist_pos:
@@ -106,7 +149,19 @@ class ShotDetector:
                     release_arc=arc,
                     trajectory=list(self.shot_trajectory),
                     ball_release_arc=ball_arc,
+                    elbow_angle_at_release=self._release_elbow_angle,
+                    knee_angle_at_release=self._release_knee_angle,
+                    release_frame_index=self._release_frame_index,
+                    elbow_angle_at_load=self._load_elbow,
+                    knee_angle_at_load=self._load_knee,
+                    load_frame_index=self._load_frame_idx,
                 )
+                self._release_elbow_angle = None
+                self._release_knee_angle = None
+                self._release_frame_index = None
+                self._load_elbow = None
+                self._load_knee = None
+                self._load_frame_idx = None
                 self.shot_events.append(event)
 
         elif self.state == self.FOLLOW_THROUGH:
@@ -115,8 +170,11 @@ class ShotDetector:
             self.shot_trajectory = []
             self._upward_count = 0
             self._peak_wrist_speed = 0.0
+            self._min_knee_angle = float('inf')
+            self._min_knee_elbow = None
+            self._min_knee_frame_idx = None
 
-        return self.state, release_arc
+        return self.state, release_arc, load_event
 
     def _is_cocking(self, knee_angle: Optional[float], vy: Optional[float]) -> bool:
         knee_bent = knee_angle is not None and knee_angle < config.COCKING_KNEE_THRESHOLD

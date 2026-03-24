@@ -22,7 +22,7 @@ class BallState:
     state: str = "UNKNOWN"              # "HELD" | "IN_FLIGHT" | "UNKNOWN"
     release_arc: Optional[float] = None # degrees above horizontal (set once per throw)
     flight_trajectory: list = field(default_factory=list)
-    just_released: bool = False         # True only on the single frame of HELD→IN_FLIGHT
+    just_released: bool = False         # True on the single frame of HELD→IN_FLIGHT
 
 
 class BallTracker:
@@ -99,9 +99,13 @@ class BallTracker:
                 self._release_arc_cache = None
             self._state = "HELD"
         else:
-            if prev_state == "HELD" or prev_state == "UNKNOWN":
-                # Transition: last touch frame
+            if prev_state == "HELD":
+                # Ball just became IN_FLIGHT — player released it
                 just_released = True
+                self._flight_positions = [ball_center]
+                self._release_arc_cache = None
+            elif prev_state == "UNKNOWN":
+                # First detection not near hand — already in flight, no release event
                 self._flight_positions = [ball_center]
                 self._release_arc_cache = None
             else:

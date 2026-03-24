@@ -2,6 +2,7 @@
 """Basketball Shot Analyzer — CLI entry point."""
 import argparse
 import os
+import math
 import sys
 import cv2
 import numpy as np
@@ -9,7 +10,7 @@ import numpy as np
 import config
 from pose_analyzer import PoseAnalyzer
 from shot_detector import ShotDetector
-from visualizer import compose_frame
+from visualizer import compose_frame, build_shot_review_panel
 from reporter import Reporter
 
 
@@ -96,6 +97,28 @@ def create_writer(output_path: str, cap, fps: float, is_image: bool):
     return cv2.VideoWriter(output_path, fourcc, fps, (w, h))
 
 
+def show_shot_review(loading_frame, release_frame, load_angles, release_angles):
+    """Open a non-blocking Shot Review window with clickable thumbnails."""
+    panel = build_shot_review_panel(loading_frame, release_frame, load_angles, release_angles)
+    win = "Shot Review"
+    cv2.imshow(win, panel)
+    panel_w = panel.shape[1]
+
+    def on_click(event, x, y, flags, param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        if x < panel_w // 2:
+            cv2.imshow("Loading Frame (Shooting Position)", loading_frame)
+            cv2.waitKey(0)
+            cv2.destroyWindow("Loading Frame (Shooting Position)")
+        else:
+            cv2.imshow("Release Frame", release_frame)
+            cv2.waitKey(0)
+            cv2.destroyWindow("Release Frame")
+
+    cv2.setMouseCallback(win, on_click)
+
+
 def run():
     args = parse_args()
     source_label, source, fps, is_image = resolve_input_source(args)
@@ -114,6 +137,25 @@ def run():
     total_frames = 0
     last_analysis = None
     release_capture_count = 0
+    loading_capture_count = 0
+    from collections import deque
+    frame_buffer: deque = deque(maxlen=config.FRAME_BUFFER_SIZE)
+    overlay_frames_remaining = 0   # countdown in frames for current overlay
+    overlay_text = None
+    overlay_color = (255, 255, 255)
+    prev_phase = "IDLE"
+    shooting_overlay_duration = int(fps * 5)   # "Shooting Position" lasts 5 seconds
+    released_overlay_duration = int(fps * 2)   # "Released" lasts 2 seconds
+    prev_elbow_angle = None        # smoothed elbow angle from previous frame (shooting side)
+    released_cooldown = 0          # prevents "Released" from re-firing within 2 seconds
+    shooting_range_counter = 0     # consecutive frames with elbow in shooting range (debounce)
+    SHOOTING_DEBOUNCE = 6          # require ~0.2s of stable elbow angle before triggering
+    elbow_angle_buffer: list = []  # rolling buffer for smoothing elbow angle
+    ELBOW_SMOOTH_WINDOW = 5        # smooth over last 5 frames
+    last_loading_annotated = None
+    last_release_annotated = None
+    last_load_angles = {}
+    last_release_angles = {}
 
     print(f"[INFO] Analyzing: {source_label}")
     print(f"[INFO] Output   : {output_path}")
@@ -130,7 +172,7 @@ def run():
             knee_angle = analysis.knee_angle_left
             elbow_angle = analysis.elbow_angle_left
 
-        phase, release_arc = detector.update(
+        phase, release_arc, load_event = detector.update(
             frame_idx, analysis.timestamp,
             analysis.wrist_pos, knee_angle, elbow_angle,
             ball_state=analysis.ball_state,
@@ -138,6 +180,44 @@ def run():
         analysis.shot_phase = phase
         if release_arc is not None:
             analysis.release_arc = release_arc
+
+        # Smooth elbow angle over last N frames to reduce noise
+        raw_elbow_valid = elbow_angle is not None and not (isinstance(elbow_angle, float) and math.isnan(elbow_angle))
+        if raw_elbow_valid:
+            elbow_angle_buffer.append(elbow_angle)
+            if len(elbow_angle_buffer) > ELBOW_SMOOTH_WINDOW:
+                elbow_angle_buffer.pop(0)
+            elbow_angle = sum(elbow_angle_buffer) / len(elbow_angle_buffer)
+
+        # Elbow-angle-based overlay triggers (primary filter)
+        # Valid elbow angle: not None and not NaN
+        elbow_valid = elbow_angle is not None and not (isinstance(elbow_angle, float) and math.isnan(elbow_angle))
+        prev_elbow_valid = prev_elbow_angle is not None and not (isinstance(prev_elbow_angle, float) and math.isnan(prev_elbow_angle))
+
+        if elbow_valid:
+            in_shooting_range = 30.0 <= elbow_angle <= 100.0
+
+            if in_shooting_range:
+                shooting_range_counter += 1
+                # Only trigger once after SHOOTING_DEBOUNCE stable frames, and only if not already showing
+                if shooting_range_counter == SHOOTING_DEBOUNCE and overlay_text != "Shooting Position":
+                    overlay_text = "Shooting Position"
+                    overlay_color = (0, 215, 255)   # amber/gold
+                    overlay_frames_remaining = shooting_overlay_duration
+            else:
+                prev_in_shooting_range = prev_elbow_valid and 30.0 <= prev_elbow_angle <= 100.0
+                # Exited range going above 100° → "Released" (overrides "Shooting Position")
+                if elbow_angle > 100.0 and prev_in_shooting_range:
+                    overlay_text = "Released"
+                    overlay_color = (0, 255, 100)   # green
+                    overlay_frames_remaining = released_overlay_duration
+                    released_cooldown = released_overlay_duration
+                shooting_range_counter = 0
+
+        if released_cooldown > 0:
+            released_cooldown -= 1
+        prev_elbow_angle = elbow_angle if elbow_valid else prev_elbow_angle
+        prev_phase = phase
 
         # Update wrist trajectory
         if analysis.wrist_pos:
@@ -154,14 +234,51 @@ def run():
         if len(ball_trajectory) > 50:
             ball_trajectory = ball_trajectory[-50:]
 
-        annotated = compose_frame(frame, analysis, wrist_trajectory, ball_trajectory)
+        active_overlay = overlay_text if overlay_frames_remaining > 0 else None
+        annotated = compose_frame(frame, analysis, wrist_trajectory, ball_trajectory,
+                                  overlay_text=active_overlay, overlay_color=overlay_color)
+        if overlay_frames_remaining > 0:
+            overlay_frames_remaining -= 1
+        frame_buffer.append((frame_idx, annotated.copy()))
 
-        # Save release frame when ball leaves the hand
+        # Save loading frame (max knee bend / pre-jump position) when COCKING→RELEASE fires
+        if load_event is not None:
+            loading_capture_count += 1
+            loading_path = f"loading_{loading_capture_count:03d}.jpg"
+            target_idx = load_event["frame_idx"]
+            saved = False
+            for buf_idx, buf_frame in frame_buffer:
+                if buf_idx == target_idx:
+                    last_loading_annotated = buf_frame.copy()
+                    cv2.imwrite(loading_path, buf_frame)
+                    saved = True
+                    break
+            last_load_angles = {"elbow": load_event["elbow"], "knee": load_event["knee"]}
+            elbow_str = f"{load_event['elbow']:.1f}°" if load_event['elbow'] is not None else "N/A"
+            knee_str = f"{load_event['knee']:.1f}°" if load_event['knee'] is not None else "N/A"
+            print(f"[LOAD]    Frame {target_idx} — {loading_path if saved else '(frame not in buffer)'}")
+            print(f"          Elbow: {elbow_str}  |  Knee: {knee_str}  (max knee bend / pre-jump position)")
+
+        # Save release frame when ball becomes IN_FLIGHT
         if (analysis.ball_state and analysis.ball_state.just_released):
             release_capture_count += 1
             release_path = f"release_{release_capture_count:03d}.jpg"
             cv2.imwrite(release_path, annotated)
-            print(f"[INFO] Release frame captured: {release_path}")
+            if analysis.shooting_side == "right":
+                rel_elbow = analysis.elbow_angle_right
+                rel_knee = analysis.knee_angle_right
+            else:
+                rel_elbow = analysis.elbow_angle_left
+                rel_knee = analysis.knee_angle_left
+            last_release_annotated = annotated.copy()
+            last_release_angles = {"elbow": rel_elbow, "knee": rel_knee}
+            elbow_str = f"{rel_elbow:.1f}°" if rel_elbow is not None else "N/A"
+            knee_str = f"{rel_knee:.1f}°" if rel_knee is not None else "N/A"
+            print(f"[RELEASE] Frame {frame_idx} — {release_path}")
+            print(f"          Elbow: {elbow_str}  |  Knee: {knee_str}  |  Side: {analysis.shooting_side}")
+            if last_loading_annotated is not None and not args.no_display:
+                show_shot_review(last_loading_annotated, last_release_annotated,
+                                 last_load_angles, last_release_angles)
 
         if not args.no_display:
             cv2.imshow("Basketball Shot Analyzer", annotated)

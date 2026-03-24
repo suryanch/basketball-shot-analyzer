@@ -173,8 +173,14 @@ class Reporter:
             shots.append({
                 "frame": event.frame,
                 "timestamp_s": round(event.timestamp, 3),
+                "elbow_angle_at_load_deg": round(event.elbow_angle_at_load, 1) if event.elbow_angle_at_load else None,
+                "knee_angle_at_load_deg": round(event.knee_angle_at_load, 1) if event.knee_angle_at_load else None,
+                "load_frame_index": event.load_frame_index,
                 "elbow_angle_at_set_deg": round(event.elbow_angle_at_set, 1) if event.elbow_angle_at_set else None,
                 "knee_angle_at_initiation_deg": round(event.knee_angle_at_initiation, 1) if event.knee_angle_at_initiation else None,
+                "elbow_angle_at_release_deg": round(event.elbow_angle_at_release, 1) if event.elbow_angle_at_release else None,
+                "knee_angle_at_release_deg": round(event.knee_angle_at_release, 1) if event.knee_angle_at_release else None,
+                "release_frame_index": event.release_frame_index,
                 "release_arc_deg": round(event.effective_release_arc, 1) if event.effective_release_arc else None,
                 "release_arc_source": "ball" if event.ball_release_arc is not None else "wrist",
                 "suggestions": sugg,
@@ -245,12 +251,16 @@ class Reporter:
 
         if shots:
             print("\n  Per-shot breakdown:")
-            print(f"  {'#':<4} {'Time':>6}  {'Elbow':>6}  {'Knee':>6}  {'Arc':>6}  {'Grade':<12}")
-            print("  " + "-" * 50)
+            print(f"  {'#':<4} {'Time':>6}  {'E@load':>7}  {'K@load':>7}  {'E@set':>6}  {'K@set':>6}  {'E@rel':>6}  {'K@rel':>6}  {'Arc':>6}  {'Grade':<12}")
+            print("  " + "-" * 85)
             for i, s in enumerate(shots, 1):
-                elbow = f"{s['elbow_angle_at_set_deg']}°" if s['elbow_angle_at_set_deg'] else "N/A"
-                knee = f"{s['knee_angle_at_initiation_deg']}°" if s['knee_angle_at_initiation_deg'] else "N/A"
+                e_load = f"{s['elbow_angle_at_load_deg']}°" if s['elbow_angle_at_load_deg'] else "N/A"
+                k_load = f"{s['knee_angle_at_load_deg']}°" if s['knee_angle_at_load_deg'] else "N/A"
+                elbow_set = f"{s['elbow_angle_at_set_deg']}°" if s['elbow_angle_at_set_deg'] else "N/A"
+                knee_set = f"{s['knee_angle_at_initiation_deg']}°" if s['knee_angle_at_initiation_deg'] else "N/A"
+                elbow_rel = f"{s['elbow_angle_at_release_deg']}°" if s['elbow_angle_at_release_deg'] else "N/A"
+                knee_rel = f"{s['knee_angle_at_release_deg']}°" if s['knee_angle_at_release_deg'] else "N/A"
                 arc = f"{s['release_arc_deg']}°" if s['release_arc_deg'] else "N/A"
-                print(f"  {i:<4} {s['timestamp_s']:>6.2f}s  {elbow:>6}  {knee:>6}  {arc:>6}  {s['grade']:<12}")
+                print(f"  {i:<4} {s['timestamp_s']:>6.2f}s  {e_load:>7}  {k_load:>7}  {elbow_set:>6}  {knee_set:>6}  {elbow_rel:>6}  {knee_rel:>6}  {arc:>6}  {s['grade']:<12}")
 
         print("=" * 60 + "\n")

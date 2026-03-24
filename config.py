@@ -75,6 +75,9 @@ BALL_ARC_SMOOTHING_WINDOW = 5
 BALL_MIN_SIZE_PX = 40           # minimum bbox width AND height to count as a real ball
 BALL_PERSON_PADDING_PX = 200    # expand person bbox by this much when filtering ball position
 
+# Frame buffer for retrospective frame capture (loading frame)
+FRAME_BUFFER_SIZE = 90  # frames (~3 seconds at 30 fps)
+
 # Model and output defaults
 DEFAULT_MODEL = "yolo11n-pose.pt"
 DEFAULT_REPORT_FILE = "shot_report.json"
