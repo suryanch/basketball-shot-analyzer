@@ -78,6 +78,10 @@ BALL_PERSON_PADDING_PX = 200    # expand person bbox by this much when filtering
 # Frame buffer for retrospective frame capture (loading frame)
 FRAME_BUFFER_SIZE = 90  # frames (~3 seconds at 30 fps)
 
+# Performance
+INFERENCE_SKIP_FRAMES = 2   # run ML every Nth frame; reuse last result in between
+INFERENCE_DEVICE = "mps"    # "mps" for Apple GPU, "cuda" for NVIDIA, "cpu" for fallback
+
 # Model and output defaults
 DEFAULT_MODEL = "yolo11n-pose.pt"
 DEFAULT_REPORT_FILE = "shot_report.json"

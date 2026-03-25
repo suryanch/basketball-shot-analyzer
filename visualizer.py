@@ -9,20 +9,22 @@ from pose_analyzer import FrameAnalysis, KeypointData, HeldObject
 
 # Load a font that supports the degree symbol; fall back to default if unavailable
 try:
-    _ANGLE_FONT = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 28)
+    _ANGLE_FONT = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 42)
 except Exception:
     try:
-        _ANGLE_FONT = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+        _ANGLE_FONT = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 42)
     except Exception:
         _ANGLE_FONT = ImageFont.load_default()
 
 
 def _put_unicode_text(frame: np.ndarray, text: str, pos: tuple, color_bgr: tuple) -> np.ndarray:
-    """Draw Unicode text (e.g. with °) onto an OpenCV frame using Pillow."""
+    """Draw Unicode text (e.g. with °) onto an OpenCV frame using Pillow, with drop shadow."""
     img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(img_pil)
-    # PIL uses RGB
     color_rgb = (color_bgr[2], color_bgr[1], color_bgr[0])
+    # Dark shadow for contrast
+    shadow_offset = 2
+    draw.text((pos[0] + shadow_offset, pos[1] + shadow_offset), text, font=_ANGLE_FONT, fill=(0, 0, 0))
     draw.text(pos, text, font=_ANGLE_FONT, fill=color_rgb)
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
@@ -231,15 +233,12 @@ def draw_ball_trajectory(frame: np.ndarray, trajectory: list) -> np.ndarray:
 
 
 def draw_ball_state(frame: np.ndarray, ball_state) -> np.ndarray:
-    """Draw ball detection label and bounding box."""
+    """Draw ball detection state label."""
     if ball_state is None or not ball_state.detected:
         return frame
     color = COLOR_BALL_TRAJECTORY if ball_state.state == "IN_FLIGHT" else (0, 200, 255)
     cv2.putText(frame, f"Ball: {ball_state.state}", (5, 55),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
-    if ball_state.bbox:
-        x1, y1, x2, y2 = [int(v) for v in ball_state.bbox]
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
     return frame
 
 
@@ -343,14 +342,7 @@ def compose_frame(frame: np.ndarray, analysis: FrameAnalysis,
     out = draw_wrist_trajectory(out, trajectory)
     if ball_trajectory:
         out = draw_ball_trajectory(out, ball_trajectory)
-    out = draw_ball_state(out, analysis.ball_state)
     out = draw_shot_phase(out, analysis.shot_phase, analysis.frame_index, analysis.timestamp)
-
-    # Hand landmarks hidden — YOLO pose skeleton already covers the arm
-
-    # Draw held object nodes
-    for obj in (analysis.held_objects or []):
-        out = draw_held_object_nodes(out, obj)
 
     if overlay_text:
         out = draw_overlay_text(out, overlay_text, overlay_color)

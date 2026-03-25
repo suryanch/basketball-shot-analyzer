@@ -41,6 +41,7 @@ class BallTracker:
             conf=config.BALL_CONF_THRESHOLD,
             classes=[config.BALL_COCO_CLASS_ID],
             verbose=False,
+            device=config.INFERENCE_DEVICE,
         )
 
         ball_center = None

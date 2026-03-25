@@ -40,6 +40,10 @@ def parse_args():
                         help="Skip state machine; report angles from a single frame directly")
     parser.add_argument("--fps", type=float, default=config.DEFAULT_FPS,
                         help=f"Override FPS for webcam (default: {config.DEFAULT_FPS})")
+    parser.add_argument("--skip", type=int, default=config.INFERENCE_SKIP_FRAMES,
+                        help=f"Run ML inference every Nth frame (default: {config.INFERENCE_SKIP_FRAMES})")
+    parser.add_argument("--save-video", action="store_true",
+                        help="Save annotated output video (disabled by default for performance)")
     return parser.parse_args()
 
 
@@ -71,7 +75,7 @@ def make_output_path(args, source_label: str, is_image: bool) -> str:
     return f"{base}_analyzed{ext}"
 
 
-def frame_generator(cap, is_image: bool, source_label: str):
+def frame_generator(cap, is_image: bool, source_label: str, is_webcam: bool = False):
     """Yields (frame_idx, frame) tuples."""
     if is_image:
         frame = cv2.imread(source_label)
@@ -128,6 +132,7 @@ def run():
     detector = ShotDetector()
     reporter = Reporter()
 
+    is_webcam = args.webcam is not None
     writer = None
     if not is_image:
         writer = create_writer(output_path, source, fps, is_image)
@@ -140,28 +145,49 @@ def run():
     loading_capture_count = 0
     from collections import deque
     frame_buffer: deque = deque(maxlen=config.FRAME_BUFFER_SIZE)
-    overlay_frames_remaining = 0   # countdown in frames for current overlay
     overlay_text = None
     overlay_color = (255, 255, 255)
     prev_phase = "IDLE"
-    shooting_overlay_duration = int(fps * 5)   # "Shooting Position" lasts 5 seconds
-    released_overlay_duration = int(fps * 2)   # "Released" lasts 2 seconds
     prev_elbow_angle = None        # smoothed elbow angle from previous frame (shooting side)
-    released_cooldown = 0          # prevents "Released" from re-firing within 2 seconds
-    shooting_range_counter = 0     # consecutive frames with elbow in shooting range (debounce)
+    shooting_range_counter = 0     # consecutive frames with elbow below entry threshold (debounce)
     SHOOTING_DEBOUNCE = 6          # require ~0.2s of stable elbow angle before triggering
+    SHOOT_ENTER_THRESHOLD = 90.0   # elbow below this triggers "Shooting Position"
+    RELEASE_THRESHOLD = 110.0      # elbow above this triggers "Released"
+    in_shooting_mode = False       # hysteresis state
+    OVERLAY_EXIT_FRAMES = 10       # frames out of range before text disappears
+    overlay_exit_counter = 0       # counts frames since angle left the active range
     elbow_angle_buffer: list = []  # rolling buffer for smoothing elbow angle
     ELBOW_SMOOTH_WINDOW = 5        # smooth over last 5 frames
+    shooting_screenshot_count = 0
+    released_screenshot_count = 0
+    shooting_capture_remaining = 0   # frames left to capture for shooting position
+    released_capture_remaining = 0   # frames left to capture for released
+    SCREENSHOT_BURST = 5             # number of frames to capture per trigger
     last_loading_annotated = None
     last_release_annotated = None
     last_load_angles = {}
     last_release_angles = {}
 
     print(f"[INFO] Analyzing: {source_label}")
-    print(f"[INFO] Output   : {output_path}")
-    print("[INFO] Press 'q' to quit (video/webcam mode)\n")
+    if args.save_video:
+        print(f"[INFO] Output   : {output_path}")
+    print(f"[INFO] Inference every {args.skip} frame(s)  |  Press 'q' to quit\n")
 
-    for frame_idx, frame in frame_generator(source, is_image, source_label):
+    for frame_idx, frame in frame_generator(source, is_image, source_label, is_webcam):
+        # Skip ML inference on non-processed frames; reuse last result
+        if last_analysis is not None and frame_idx % args.skip != 0:
+            annotated = compose_frame(frame, last_analysis, wrist_trajectory, ball_trajectory,
+                                      overlay_text=overlay_text,
+                                      overlay_color=overlay_color)
+            if not args.no_display:
+                cv2.imshow("Basketball Shot Analyzer", annotated)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+            if writer and args.save_video:
+                writer.write(annotated)
+            total_frames += 1
+            continue
+
         analysis = analyzer.analyze_frame(frame, frame_idx, fps)
 
         # Determine which knee/elbow angles to pass to detector (shooting side)
@@ -192,30 +218,48 @@ def run():
         # Elbow-angle-based overlay triggers (primary filter)
         # Valid elbow angle: not None and not NaN
         elbow_valid = elbow_angle is not None and not (isinstance(elbow_angle, float) and math.isnan(elbow_angle))
-        prev_elbow_valid = prev_elbow_angle is not None and not (isinstance(prev_elbow_angle, float) and math.isnan(prev_elbow_angle))
 
         if elbow_valid:
-            in_shooting_range = 30.0 <= elbow_angle <= 100.0
+            # Clear overlay if angle has been out of the active range for too long
+            if overlay_text == "Shooting Position":
+                if elbow_angle >= SHOOT_ENTER_THRESHOLD:
+                    overlay_exit_counter += 1
+                    if overlay_exit_counter >= OVERLAY_EXIT_FRAMES:
+                        overlay_text = None
+                        in_shooting_mode = False
+                        overlay_exit_counter = 0
+                else:
+                    overlay_exit_counter = 0
+            elif overlay_text == "Released":
+                if elbow_angle <= RELEASE_THRESHOLD:
+                    overlay_exit_counter += 1
+                    if overlay_exit_counter >= OVERLAY_EXIT_FRAMES:
+                        overlay_text = None
+                        overlay_exit_counter = 0
+                else:
+                    overlay_exit_counter = 0
 
-            if in_shooting_range:
-                shooting_range_counter += 1
-                # Only trigger once after SHOOTING_DEBOUNCE stable frames, and only if not already showing
-                if shooting_range_counter == SHOOTING_DEBOUNCE and overlay_text != "Shooting Position":
-                    overlay_text = "Shooting Position"
-                    overlay_color = (0, 215, 255)   # amber/gold
-                    overlay_frames_remaining = shooting_overlay_duration
+            # Trigger new overlays
+            if not in_shooting_mode:
+                if elbow_angle < SHOOT_ENTER_THRESHOLD:
+                    shooting_range_counter += 1
+                    if shooting_range_counter >= SHOOTING_DEBOUNCE:
+                        in_shooting_mode = True
+                        shooting_range_counter = 0
+                        overlay_text = "Shooting Position"
+                        overlay_color = (0, 215, 255)   # amber/gold
+                        overlay_exit_counter = 0
+                        shooting_capture_remaining = SCREENSHOT_BURST
+                else:
+                    shooting_range_counter = 0
             else:
-                prev_in_shooting_range = prev_elbow_valid and 30.0 <= prev_elbow_angle <= 100.0
-                # Exited range going above 100° → "Released" (overrides "Shooting Position")
-                if elbow_angle > 100.0 and prev_in_shooting_range:
+                if elbow_angle > RELEASE_THRESHOLD:
+                    in_shooting_mode = False
                     overlay_text = "Released"
                     overlay_color = (0, 255, 100)   # green
-                    overlay_frames_remaining = released_overlay_duration
-                    released_cooldown = released_overlay_duration
-                shooting_range_counter = 0
+                    overlay_exit_counter = 0
+                    released_capture_remaining = SCREENSHOT_BURST
 
-        if released_cooldown > 0:
-            released_cooldown -= 1
         prev_elbow_angle = elbow_angle if elbow_valid else prev_elbow_angle
         prev_phase = phase
 
@@ -234,12 +278,23 @@ def run():
         if len(ball_trajectory) > 50:
             ball_trajectory = ball_trajectory[-50:]
 
-        active_overlay = overlay_text if overlay_frames_remaining > 0 else None
         annotated = compose_frame(frame, analysis, wrist_trajectory, ball_trajectory,
-                                  overlay_text=active_overlay, overlay_color=overlay_color)
-        if overlay_frames_remaining > 0:
-            overlay_frames_remaining -= 1
+                                  overlay_text=overlay_text, overlay_color=overlay_color)
         frame_buffer.append((frame_idx, annotated.copy()))
+
+        if shooting_capture_remaining > 0:
+            shooting_screenshot_count += 1
+            path = os.path.expanduser(f"~/Desktop/shooting_position_{shooting_screenshot_count:03d}.jpg")
+            cv2.imwrite(path, annotated)
+            print(f"[SHOT POS] Frame {frame_idx} — {path}")
+            shooting_capture_remaining -= 1
+
+        if released_capture_remaining > 0:
+            released_screenshot_count += 1
+            path = os.path.expanduser(f"~/Desktop/released_{released_screenshot_count:03d}.jpg")
+            cv2.imwrite(path, annotated)
+            print(f"[RELEASED] Frame {frame_idx} — {path}")
+            released_capture_remaining -= 1
 
         # Save loading frame (max knee bend / pre-jump position) when COCKING→RELEASE fires
         if load_event is not None:
@@ -280,6 +335,9 @@ def run():
                 show_shot_review(last_loading_annotated, last_release_annotated,
                                  last_load_angles, last_release_angles)
 
+        last_analysis = analysis
+        total_frames += 1
+
         if not args.no_display:
             cv2.imshow("Basketball Shot Analyzer", annotated)
             key = cv2.waitKey(1 if not is_image else 0) & 0xFF
@@ -289,11 +347,8 @@ def run():
         if is_image:
             cv2.imwrite(output_path, annotated)
             print(f"[INFO] Annotated image saved: {output_path}")
-        elif writer:
+        elif writer and args.save_video:
             writer.write(annotated)
-
-        last_analysis = analysis
-        total_frames += 1
 
     # Cleanup
     if writer:
@@ -302,7 +357,7 @@ def run():
         source.release()
     cv2.destroyAllWindows()
 
-    if not is_image:
+    if not is_image and args.save_video:
         print(f"[INFO] Annotated video saved: {output_path}")
 
     # Generate report

@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 import numpy as np
 from ultralytics import YOLO
+import config
 
 import config
 from angle_calculator import calculate_angle
@@ -65,7 +66,7 @@ class PoseAnalyzer:
 
     def analyze_frame(self, frame: np.ndarray, frame_idx: int, fps: float) -> FrameAnalysis:
         timestamp = frame_idx / fps if fps > 0 else 0.0
-        results = self.model(frame, conf=self.conf, iou=self.iou, verbose=False)
+        results = self.model(frame, conf=self.conf, iou=self.iou, verbose=False, device=config.INFERENCE_DEVICE)
         persons = self._extract_keypoints(results)
         primary = self._select_primary_person(persons)
 
@@ -73,7 +74,7 @@ class PoseAnalyzer:
             frame_index=frame_idx,
             timestamp=timestamp,
             persons=persons,
-            annotated_frame=results[0].plot() if results else frame,
+            annotated_frame=None,
             held_objects=[],
         )
 
